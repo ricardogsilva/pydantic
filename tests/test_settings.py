@@ -320,8 +320,9 @@ def test_env_takes_precedence(env):
         foo: int
         bar: str
 
-        def _build_values(self, init_kwargs, _env_file):
-            return {**init_kwargs, **self._build_environ()}
+        def _build_values(self, init_kwargs, environ_values, additional_values):
+            # redefined in order to override the precedence rules to a different setting
+            return {**init_kwargs, **environ_values, **additional_values}
 
     env.set('BAR', 'env setting')
 
@@ -335,19 +336,31 @@ def test_config_file_settings_nornir(env):
     See https://github.com/samuelcolvin/pydantic/pull/341#issuecomment-450378771
     """
 
+    def some_settings_getter():
+        # simulates retrieving settings values from elsewhere
+        return {
+            'a': 'config a',
+            'b': 'config b',
+            'c': 'config c',
+        }
+
     class Settings(BaseSettings):
         a: str
         b: str
         c: str
 
-        def _build_values(self, init_kwargs, _env_file):
-            config_settings = init_kwargs.pop('__config_settings__')
-            return {**config_settings, **init_kwargs, **self._build_environ()}
+        class Config:
+            additional_getters = [
+                some_settings_getter,
+            ]
+
+        def _build_values(self, init_kwargs, environ_values, additional_values):
+            # redefined in order to override the precedence rules to a different setting
+            return {**additional_values, **init_kwargs, **environ_values}
 
     env.set('C', 'env setting c')
+    s = Settings(b='argument b', c='argument c')
 
-    config = {'a': 'config a', 'b': 'config b', 'c': 'config c'}
-    s = Settings(__config_settings__=config, b='argument b', c='argument c')
     assert s.a == 'config a'
     assert s.b == 'argument b'
     assert s.c == 'env setting c'
@@ -374,7 +387,7 @@ def test_env_file_config(env, tmp_path):
         c: str
 
         class Config:
-            env_file = p
+            additional_getters = [(read_env_file, {'file_path': p})]
 
     env.set('A', 'overridden var')
 
@@ -395,7 +408,7 @@ def test_env_file_config_case_sensitive(tmp_path):
         c: str
 
         class Config:
-            env_file = p
+            additional_getters = [(read_env_file, {'file_path': p})]
             case_sensitive = True
 
     with pytest.raises(ValidationError) as exc_info:
@@ -420,7 +433,7 @@ export C="best string"
         c: str
 
         class Config:
-            env_file = p
+            additional_getters = [(read_env_file, {'file_path': p})]
 
     env.set('A', 'overridden var')
 
@@ -438,40 +451,44 @@ def test_env_file_none(tmp_path):
     class Settings(BaseSettings):
         a: str = 'xxx'
 
-    s = Settings(_env_file=p)
+        class Config:
+            additional_getters = [(read_env_file, {'file_path': p})]
+
+    s = Settings()
     assert s.a == 'xxx'
 
 
-@pytest.mark.skipif(not dotenv, reason='python-dotenv not installed')
-def test_env_file_override_file(tmp_path):
-    p1 = tmp_path / '.env'
-    p1.write_text(test_env_file)
-    p2 = tmp_path / '.env.prod'
-    p2.write_text('A="new string"')
+# @pytest.mark.skipif(not dotenv, reason='python-dotenv not installed')
+# def test_env_file_override_file(tmp_path):
+#     p1 = tmp_path / '.env'
+#     p1.write_text(test_env_file)
+#     p2 = tmp_path / '.env.prod'
+#     p2.write_text('A="new string"')
+#
+#     class Settings(BaseSettings):
+#         a: str
+#
+#         class Config:
+#             env_file = str(p1)
+#             additional_getters = [(read_env_file, {'file_path': p1})]
+#
+#     s = Settings(additional_getters=[(read_env_file, {'file_path': p2})])
+#     assert s.a == 'new string'
 
-    class Settings(BaseSettings):
-        a: str
 
-        class Config:
-            env_file = str(p1)
-
-    s = Settings(_env_file=p2)
-    assert s.a == 'new string'
-
-
-@pytest.mark.skipif(not dotenv, reason='python-dotenv not installed')
-def test_env_file_override_none(tmp_path):
-    p = tmp_path / '.env'
-    p.write_text(test_env_file)
-
-    class Settings(BaseSettings):
-        a: str = None
-
-        class Config:
-            env_file = p
-
-    s = Settings(_env_file=None)
-    assert s.a is None
+# @pytest.mark.skipif(not dotenv, reason='python-dotenv not installed')
+# def test_env_file_override_none(tmp_path):
+#     p = tmp_path / '.env'
+#     p.write_text(test_env_file)
+#
+#     class Settings(BaseSettings):
+#         a: str = None
+#
+#         class Config:
+#             env_file = p
+#
+#     s = Settings(_env_file=None)
+#     assert s.a is None
 
 
 @pytest.mark.skipif(not dotenv, reason='python-dotenv not installed')
@@ -479,18 +496,21 @@ def test_env_file_not_a_file(env):
     class Settings(BaseSettings):
         a: str = None
 
+        class Config:
+            additional_getters = [(read_env_file, {'file_path': 'nothing'})]
+
     env.set('A', 'ignore non-file')
-    s = Settings(_env_file='tests/')
+    s = Settings()
     assert s.a == 'ignore non-file'
 
 
-@pytest.mark.skipif(not dotenv, reason='python-dotenv not installed')
-def test_read_env_file_cast_sensitive(tmp_path):
-    p = tmp_path / '.env'
-    p.write_text('a="test"\nB=123')
-
-    assert read_env_file(p) == {'a': 'test', 'b': '123'}
-    assert read_env_file(p, case_sensitive=True) == {'a': 'test', 'B': '123'}
+# @pytest.mark.skipif(not dotenv, reason='python-dotenv not installed')
+# def test_read_env_file_cast_sensitive(tmp_path):
+#     p = tmp_path / '.env'
+#     p.write_text('a="test"\nB=123')
+#
+#     assert read_env_file(p) == {'a': 'test', 'b': '123'}
+#     assert read_env_file(p, case_sensitive=True) == {'a': 'test', 'B': '123'}
 
 
 @pytest.mark.skipif(not dotenv, reason='python-dotenv not installed')
@@ -498,7 +518,7 @@ def test_read_env_file_syntax_wrong(tmp_path):
     p = tmp_path / '.env'
     p.write_text('NOT_AN_ASSIGNMENT')
 
-    assert read_env_file(p, case_sensitive=True) == {'NOT_AN_ASSIGNMENT': None}
+    assert read_env_file(p) == {'NOT_AN_ASSIGNMENT': None}
 
 
 @pytest.mark.skipif(not dotenv, reason='python-dotenv not installed')
@@ -520,7 +540,10 @@ MY_VAR='Hello world'
         meaning_of_life: int
         my_var: str
 
-    s = Settings(_env_file=str(p))
+        class Config:
+            additional_getters = [(read_env_file, {'file_path': p})]
+
+    s = Settings()
     assert s.dict() == {
         'environment': 'production',
         'redis_address': 'localhost:6379',

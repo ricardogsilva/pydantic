@@ -1,18 +1,66 @@
+import collections.abc
 import os
 import warnings
 from pathlib import Path
-from typing import AbstractSet, Any, Dict, List, Mapping, Optional, Union
+from typing import AbstractSet, Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 from .fields import ModelField
 from .main import BaseModel, Extra
 from .typing import display_as_type
 from .utils import deep_update, sequence_like
 
-env_file_sentinel = str(object())
-
 
 class SettingsError(ValueError):
     pass
+
+
+def read_additional_values(
+    getter: Callable[..., Dict[str, str]], is_case_sensitive: bool, env_prefix: str, **getter_kwargs: Any
+) -> Dict[str, str]:
+    additional_values = getter(**getter_kwargs)
+    return normalize_items(additional_values, is_case_sensitive, env_prefix)
+
+
+def read_env_file(file_path: Path) -> Dict[str, Optional[str]]:
+    try:
+        from dotenv import dotenv_values
+    except ImportError as e:
+        raise ImportError('python-dotenv is not installed, run `pip install pydantic[dotenv]`') from e
+
+    file_vars: Dict[str, Optional[str]] = dotenv_values(file_path)
+    return file_vars
+
+
+def read_env_file_from_named_env_var(env_var: str) -> Dict[str, str]:
+    path = Path(os.getenv(env_var))
+    return read_env_file(path)
+
+
+def read_filesystem_directory(directory: Path) -> Dict[str, str]:
+    """Read values from a secrets directory"""
+    result = {}
+    if directory.is_dir():
+        for item in directory.iterdir():
+            if item.is_file():
+                contents = item.read_text(encoding='utf-8').strip()
+                result[item.name] = contents
+    return result
+
+
+# TODO: remove this
+def normalize_items(items: Dict[str, str], case_sensitive: bool, env_prefix: str) -> Dict[str, str]:
+    print(f'locals: {locals()}')
+    result = {}
+    for name, value in items.items():
+        if value is None:
+            continue
+        elif case_sensitive:
+            new_name = name
+        else:
+            new_name = name.lower()
+        new_name = new_name.replace(env_prefix, '')
+        result[new_name] = value
+    return result
 
 
 class BaseSettings(BaseModel):
@@ -23,14 +71,41 @@ class BaseSettings(BaseModel):
     Heroku and any 12 factor app design.
     """
 
-    def __init__(__pydantic_self__, _env_file: Union[Path, str, None] = env_file_sentinel, **values: Any) -> None:
+    def __init__(__pydantic_self__, **values: Any) -> None:
         # Uses something other than `self` the first arg to allow "self" as a settable attribute
-        super().__init__(**__pydantic_self__._build_values(values, _env_file=_env_file))
+        additional_values = __pydantic_self__._get_additional_values()
+        environ_values = __pydantic_self__._build_environ()
+        consolidated = __pydantic_self__._build_values(values, environ_values, additional_values)
+        super().__init__(**consolidated)
 
-    def _build_values(self, init_kwargs: Dict[str, Any], _env_file: Union[Path, str, None] = None) -> Dict[str, Any]:
-        return deep_update(self._build_environ(_env_file), init_kwargs)
+    def _build_values(
+        self, init_kwargs: Any, environ_values: Dict[str, Optional[str]], additional_values: Dict[str, str]
+    ) -> Dict[str, str]:
+        # Precedence rules (first means highest priority):
+        # 1. Arguments to `__init__`
+        # 2. Environment variables
+        # 3. Values gotten from additional methods (.env files, etc)
+        # 4. Defaults in the class definition
+        return deep_update(deep_update(additional_values, environ_values), init_kwargs)
 
-    def _build_environ(self, _env_file: Union[Path, str, None] = None) -> Dict[str, Optional[str]]:
+    def _get_additional_values(self) -> Dict[str, str]:
+        additional_getters: List[
+            Union[Callable[..., Dict[str, str]], Tuple[Callable[..., Dict[str, str]], Dict[str, Any]]]
+        ] = self.__config__.additional_getters or []
+        result = {}
+        for getter_info in additional_getters:
+            if isinstance(getter_info, collections.abc.Callable):
+                getter: Callable[..., Dict[str, str]] = getter_info
+                getter_kwargs = {}
+            else:
+                getter: Callable[..., Dict[str, str]] = getter_info[0]
+                getter_kwargs = getter_info[1]
+            getter_values = getter(**getter_kwargs)
+            normalized = self._normalize_items(getter_values)
+            result.update(normalized)
+        return result
+
+    def _build_environ(self) -> Dict[str, Optional[str]]:
         """
         Build environment variables suitable for passing to the Model.
         """
@@ -40,13 +115,6 @@ class BaseSettings(BaseModel):
             env_vars: Mapping[str, Optional[str]] = os.environ
         else:
             env_vars = {k.lower(): v for k, v in os.environ.items()}
-
-        env_file = _env_file if _env_file != env_file_sentinel else self.__config__.env_file
-        if env_file is not None:
-            env_path = Path(env_file)
-            if env_path.is_file():
-                env_vars = {**read_env_file(env_path, case_sensitive=self.__config__.case_sensitive), **env_vars}
-
         for field in self.__fields__.values():
             env_val: Optional[str] = None
             for env_name in field.field_info.extra['env_names']:
@@ -65,13 +133,40 @@ class BaseSettings(BaseModel):
             d[field.alias] = env_val
         return d
 
+    def _normalize_items(self, items: Dict[str, str]) -> Dict[str, str]:
+        result = {}
+        legal_names = [f.alias for f in self.__fields__.values()]
+        legal_lower_names = [val.lower() for val in legal_names]
+        relaxed_extra = self.__config__.extra in (Extra.allow, Extra.ignore)
+        for name, value in items.items():
+            if value is None:
+                continue
+            elif self.__config__.case_sensitive:
+                if name in legal_names or relaxed_extra:
+                    new_name = name
+                else:
+                    continue
+            else:
+                new_name = name.lower()
+                if not (new_name in legal_lower_names or relaxed_extra):
+                    continue
+            new_name = new_name.replace(self.__config__.env_prefix, '')
+            result[new_name] = value
+        return result
+
     class Config:
         env_prefix = ''
-        env_file = None
         validate_all = True
         extra = Extra.forbid
         arbitrary_types_allowed = True
         case_sensitive = False
+        additional_getters: Optional[
+            List[Union[Callable[..., Dict[str, str]], Tuple[Callable[..., Dict[str, str]], Dict[str, Any]]]]
+        ] = None
+        # additional_getters = [
+        #     (read_env_file, Path(".env")),
+        #     (read_filesystem_directory, Path("/run/secrets"))
+        # ]
 
         @classmethod
         def prepare_field(cls, field: ModelField) -> None:
@@ -100,16 +195,3 @@ class BaseSettings(BaseModel):
             field.field_info.extra['env_names'] = env_names
 
     __config__: Config  # type: ignore
-
-
-def read_env_file(file_path: Path, *, case_sensitive: bool = False) -> Dict[str, Optional[str]]:
-    try:
-        from dotenv import dotenv_values
-    except ImportError as e:
-        raise ImportError('python-dotenv is not installed, run `pip install pydantic[dotenv]`') from e
-
-    file_vars: Dict[str, Optional[str]] = dotenv_values(file_path)
-    if not case_sensitive:
-        return {k.lower(): v for k, v in file_vars.items()}
-    else:
-        return file_vars
